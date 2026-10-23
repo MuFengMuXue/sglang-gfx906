@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
+    CompressedTensorsWNA16Triton,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A8mxfp4MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
@@ -81,6 +82,16 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+
+
+def _on_gfx906() -> bool:
+    """MI50/MI60 (gfx906) has no Marlin kernels; use the Triton W4A16 path."""
+    if not _is_hip:
+        return False
+    try:
+        return "gfx906" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -138,6 +149,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        # Populated by the loader on gfx906: checkpoint modules stored as plain
+        # weights even though the quant config does not list them in `ignore`.
+        self.gfx906_plain_prefixes = set()
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -736,7 +750,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
                 scheme_cls = (
-                    XPUCompressedTensorsWNA16 if _is_xpu else CompressedTensorsWNA16
+                    CompressedTensorsWNA16Triton
+                    if _on_gfx906()
+                    else XPUCompressedTensorsWNA16
+                    if _is_xpu
+                    else CompressedTensorsWNA16
                 )
                 return scheme_cls(
                     num_bits=weight_quant.num_bits,
@@ -1028,6 +1046,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         # TODO : add compressed-tensors as dep
         # so we do not have to re-write these functions
         # need to make accelerate optional in ct to do this
+
+        # Checkpoint-driven plain-module list (gfx906): these modules carry
+        # plain bf16/fp16 weights even though the quant config may not ignore
+        # them, so they must not get packed weight placeholders.
+        if layer_name is not None and self.gfx906_plain_prefixes:
+            if any(layer_name.startswith(p) for p in self.gfx906_plain_prefixes):
+                return None
 
         # Use the new get_scheme_dict method to extract QuantizationArgs
         scheme_dict = self.get_scheme_dict(layer, layer_name, matched_target)

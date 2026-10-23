@@ -336,6 +336,8 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        # gfx906/MI50 text-only serving (vision path needs bf16).
+        "Qwen3_5ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
