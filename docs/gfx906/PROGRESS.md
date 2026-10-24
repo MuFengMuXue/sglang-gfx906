@@ -47,7 +47,7 @@ python -m sglang.launch_server \
   --attention-backend gfx906_fa \
   --kv-cache-dtype gfx906_q8_0 \
   --cuda-graph-backend-decode=full \
-  --cuda-graph-bs-decode 1 \
+  --cuda-graph-bs-decode 1 2 \
   --cuda-graph-backend-prefill=disabled \
   --context-length 4096 --mem-fraction-static 0.9 \
   --max-running-requests 16 \
@@ -344,7 +344,7 @@ Q8 KV 的容量收益是 **+30.6%**，速度只损失约 2%。
 
 ### 限制
 
-- Q8 KV 目前只验证了 `--cuda-graph-bs-decode 1`；多 batch/spec decode 未测
+- Q8 KV 已验证 `--cuda-graph-bs-decode 1 2`；bs=4/8 与 spec decode 未测
 - Q8 KV 的 `store_dtype`/descriptor 对 `row_bytes` 仍假设统一 dtype（K 是 uint8），
   不影响当前 NHD/token-major 路径，但 PD transfer / post-capture VMM 未验证
 - FA backend 依赖 vLLM 仓库的 `_gfx906_fa_C*.so`；Q8 KV 写入依赖同一扩展
@@ -395,9 +395,9 @@ ssm_states_contig[state_cache_indices] = 0
 
 只清零本请求的 slot；prefix cache / 后续 chunk 不受影响。
 
-同时修了并发路径：decode graph 只在 `batch_size == graph_max_bs` 时使用静态
-graph buffer；两路并发（bs=2）会走 eager metadata，不再错用只为 bs=1 捕获的
-buffer。
+同时修了并发路径：只有 graph capture/replay 使用静态 graph buffer；eager
+decode（或没有对应捕获的 bs）使用 live metadata。decode graph 现在捕获
+bs=1/2，两路并发走 bs=2 graph，不再错用只为 bs=1 捕获的 buffer。
 
 ### 验证
 
@@ -406,7 +406,7 @@ buffer。
 | 2431 tokens，连续 3 次 | 正确 |
 | 3451 tokens | 正确 |
 | 3791 tokens | 正确 |
-| 两路并发（2402 + 2062 tokens） | 两路都正确 |
+| 两路并发（2402 + 2062 tokens） | 两路都正确（decode graph bs=2） |
 | 短上下文 decode | **33.6–33.7 tok/s**（未回退） |
 | 1..20 / 中文诗 | 正确 |
 
@@ -417,5 +417,5 @@ buffer。
 
 - 长上下文修复只在 `extend_prefix_lens == 0` 时清零；如果后续发现 prefix-cache
   恢复状态也有旧值，需要在 restore 路径同样校验。
-- 两路并发目前走 eager decode（graph 只捕获 bs=1），正确但吞吐低于单路 graph；
-  多 bs graph 仍是下一步。
+- decode graph 已捕获 bs=1/2；bs=4/8 未测（显存余量约 0.8 GiB，继续加 bs 可能 OOM）。
+- 两路并发现在走 bs=2 graph，输出正确；spec decode 与 bs=4/8 graph 仍待验证。

@@ -42,6 +42,7 @@ class Gfx906FAttnBackend(AttentionBackend):
         self._graph_cu_q = None
         self._graph_slot = None
         self._graph_seq_lens = None
+        self._graph_replay = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self._graph_max_bs = max_bs
@@ -115,6 +116,7 @@ class Gfx906FAttnBackend(AttentionBackend):
         return self.forward_metadata
 
     def init_forward_metadata(self, forward_batch):
+        self._graph_replay = False
         self._build_metadata(forward_batch)
         qm = self._quant_method()
         if qm is not None and forward_batch.forward_mode.is_extend():
@@ -128,6 +130,7 @@ class Gfx906FAttnBackend(AttentionBackend):
             return None
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        self._graph_replay = True
         self._build_metadata(forward_batch)
         # Replay path: refresh the static graph block table OUTSIDE the graph.
         # The captured graph reads this tensor; copying req_to_token before the
@@ -165,7 +168,10 @@ class Gfx906FAttnBackend(AttentionBackend):
             self._graph_block_table is not None
             and self._graph_seq_lens is not None
             and forward_batch.forward_mode.is_decode()
-            and b == self._graph_max_bs
+            and (
+                self._graph_replay
+                or torch.cuda.is_current_stream_capturing()
+            )
         ):
             # Decode graph: always read the persistent graph buffers. They are
             # refreshed outside the graph before replay; self.forward_metadata
