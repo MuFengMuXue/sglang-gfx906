@@ -1,10 +1,10 @@
 # SGLang on gfx906 (MI50 / Radeon Pro VII) — 进度与下一步
 
 最后更新：2026-10-24
-状态：**已跑通 vLLM 的 gfx906 FA + Q8 KV 方案**。Qwen3.8-27B-AWQ-INT4 在 2× MI50
-上 TP=2，CUDA graph decode 约 **22.0 tok/s**，KV 容量 **106,663 tokens**
-（fp16 为 81,664，+30.6%），输出与 eager/Triton 一致。服务当前在
-`127.0.0.1:30000` 运行。
+状态：**已跑通 vLLM 的 gfx906 FA + Q8 KV 方案，并接入 fused norm/silu + LLMM1**。
+Qwen3.8-27B-AWQ-INT4 在 2× MI50 上 TP=2，短上下文 CUDA graph decode 约
+**33.7 tok/s**，KV 容量 **106,663 tokens**（fp16 为 81,664，+30.6%）。
+长上下文（约 2.4k tokens 以上）目前仍有 NaN/GPU Hang 问题，见第 8 节。
 
 ---
 
@@ -86,8 +86,9 @@ python -m sglang.launch_server \
 
 | 场景 | 结果 |
 |---|---|
-| 最终配置：FA + Q8 KV + graph | **22.0 token/s**（222 tokens / 11.3 s） |
-| fp16 FA + graph | 22.4 token/s |
+| 最终配置：FA + Q8 KV + fused ops + LLMM1 + graph | **33.7 token/s**（253 tokens / 8.7 s） |
+| 同上，仅 fused ops（LLMM1 前） | 23.6 token/s |
+| 原始 FA + Q8 KV + graph | 22.0 token/s |
 | Triton + fp16 + graph | 22.8 token/s |
 | KV 容量（Q8 vs fp16） | **106,663 vs 81,664 tokens**（+30.6%） |
 | 启动时间（磁盘热） | ~55 s（含 graph capture） |
@@ -360,3 +361,38 @@ Q8 KV 的容量收益是 **+30.6%**，速度只损失约 2%。
   - FA kernel：`csrc/gfx906_fa/`、`vllm/gfx906_fa/`
 - 模型：`/home/neko/Models/Qwen3.8-27B-AWQ-INT4`
 - 启动日志：`/tmp/sglang_gptq.log`
+
+---
+
+## 8. 当前问题：长上下文 NaN / GPU Hang（2026-10-24）
+
+短上下文（<2k tokens）已到 **33.7 tok/s**，但约 **2.4k tokens** 的 prompt 会输出
+连续的 `!`。logprobs 显示 top-3 token 是 id 0/1/2（`!`、`"`、`#`），说明最终
+logits 已经变成 NaN/常数，不是普通的量化误差。
+
+已排除/确认：
+
+- `--attention-backend triton` + fp16 KV 同样复现，所以不是 Q8 KV 或 FA 单独导致
+- 关闭 radix cache、关闭 chunked prefill（单 chunk 2431）仍然复现
+- 2076 tokens 正常，2416+ 失败；阈值大约在 2.2k–2.4k
+- 反复发长 prompt 会触发 `GPU Hang`；GPU0 VRAM 残留约 17GB，`KFD Processes`
+  为空，需要 **重启机器** 才能清掉
+
+新增的隔离开关：
+
+```bash
+SGLANG_GFX906_FUSED_OPS=0   # 关闭 fused rms_norm / silu_and_mul
+SGLANG_GFX906_LLMM1=0       # 关闭 LLMM1，回退 F.linear
+SGLANG_MAMBA_CONV_DTYPE=float32  # conv state 用 fp32（默认当前是 float16）
+```
+
+重启后的排查顺序：
+
+1. 两个优化都关 + `SGLANG_MAMBA_CONV_DTYPE=float16`，跑 2431 prompt：确认是否是
+   改动前就存在的 GDN/fp16 长序列问题
+2. 改 `SGLANG_MAMBA_CONV_DTYPE=float32` 再跑
+3. 只开 fused / 只开 LLMM1，二选一定位
+4. 如果确认是 LLMM1：先只对 qkv / in_proj 用 LLMM1，`lm_head` 保持 `F.linear`
+   （lm_head 的 hidden 值幅度最大，最可能是 fp16 half2 累加溢出）
+5. 如果确认是 GDN 长序列：评估移植 vLLM 的
+   `csrc/gdn/fused_gdn_decode_kernel.cu`，或改 SGLang FLA chunk 路径
