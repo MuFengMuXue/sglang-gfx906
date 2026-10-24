@@ -5,7 +5,8 @@
 Qwen3.8-27B-AWQ-INT4 在 2× MI50 上 TP=2，CUDA graph decode 约
 **33.7 tok/s**，KV 容量 **106,663 tokens**（fp16 为 81,664，+30.6%）。
 长上下文（2.4k / 3.4k / 3.8k tokens）和两路并发均已验证正确；长上下文 NaN
-的根因与修复见第 8 节。
+的根因与修复见第 8 节。**16k context / >4k prompt 仍未解决**，详细记录见
+[`LONG_CONTEXT_16K.md`](LONG_CONTEXT_16K.md)。
 
 ---
 
