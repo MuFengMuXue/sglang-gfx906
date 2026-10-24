@@ -500,6 +500,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     effective_num_layers,
                     kv_size,
                 )
+            elif self.kv_cache_dtype_str == "gfx906_q8_0":
+                from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                    get_kv_cache_quant_method,
+                )
+
+                quant_method = get_kv_cache_quant_method(
+                    "gfx906_q8_0",
+                    num_layers=effective_num_layers,
+                    device=kvc.device,
+                    page_size=kvc.page_size,
+                )
+                quant_method.configure_attention_backends_from_server_args(
+                    kvc.server_args
+                )
+                cell_size = quant_method.compute_cell_size(
+                    n,
+                    model_config.head_dim,
+                    effective_num_layers,
+                    kv_size,
+                )
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (

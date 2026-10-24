@@ -1019,6 +1019,14 @@ KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
     "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
 }
 
+# gfx906: q8_0 K + fp16 V. Imported lazily at the bottom so that the method
+# module can subclass KVCacheQuantMethodBase defined above.
+from sglang.srt.layers.quantization.gfx906_q8_kv_cache import (  # noqa: E402
+    Gfx906Q8KVCacheMethod,
+)
+
+KV_CACHE_QUANT_REGISTRY["gfx906_q8_0"] = Gfx906Q8KVCacheMethod
+
 
 def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
     """Resolve the explicit FP4 KV cache recipe from ``--kv-cache-dtype``."""

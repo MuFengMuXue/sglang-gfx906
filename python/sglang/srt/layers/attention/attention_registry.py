@@ -221,6 +221,13 @@ def create_torch_native_backend(runner):
     return TorchNativeAttnBackend(runner)
 
 
+@register_attention_backend("gfx906_fa")
+def create_gfx906_fa_backend(runner):
+    from sglang.srt.layers.attention.gfx906_fa_backend import Gfx906FAttnBackend
+
+    return Gfx906FAttnBackend(runner)
+
+
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend

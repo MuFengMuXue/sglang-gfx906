@@ -427,6 +427,17 @@ class KVCacheConfigurator:
         return quant_method
 
     def _build_mha_quant_method(self, *, num_layers: int):
+        if self.kv_cache_dtype_str == "gfx906_q8_0":
+            quant_method = get_kv_cache_quant_method(
+                "gfx906_q8_0",
+                num_layers=num_layers,
+                device=self.device,
+                page_size=self.page_size,
+            )
+            quant_method.configure_attention_backends_from_server_args(
+                self.server_args
+            )
+            return quant_method
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             return get_kv_cache_quant_method("cpu_fp8_e4m3")
         return self._build_fp4_quant_method(num_layers=num_layers)

@@ -92,6 +92,7 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    "gfx906_fa",  # MI50/MI60 Q8 FlashAttention backend
     # Other platforms
     "intel_amx",
     "ascend",

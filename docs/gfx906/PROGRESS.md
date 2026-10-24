@@ -1,9 +1,10 @@
 # SGLang on gfx906 (MI50 / Radeon Pro VII) — 进度与下一步
 
 最后更新：2026-10-24
-状态：**能跑通且已提速**。Qwen3.8-27B-AWQ-INT4 在 2× MI50 上以 TP=2 启动，
-输出连贯中文；CUDA graph + exllama W4A16 后 decode 约 **22.8 tok/s**。
-服务当前在 `127.0.0.1:30000` 运行。
+状态：**已跑通 vLLM 的 gfx906 FA + Q8 KV 方案**。Qwen3.8-27B-AWQ-INT4 在 2× MI50
+上 TP=2，CUDA graph decode 约 **22.0 tok/s**，KV 容量 **106,663 tokens**
+（fp16 为 81,664，+30.6%），输出与 eager/Triton 一致。服务当前在
+`127.0.0.1:30000` 运行。
 
 ---
 
@@ -36,13 +37,16 @@
 ## 2. 启动方式（已验证）
 
 ```fish
+set -gx SGLANG_MAMBA_CONV_DTYPE float16
 cd /home/neko/Projects/sglang-gfx906
 source .venv/bin/activate.fish
 python -m sglang.launch_server \
   --model-path /home/neko/Models/Qwen3.8-27B-AWQ-INT4 \
   --language-model-only --dtype float16 --tp 2 \
-  --attention-backend triton \
+  --attention-backend gfx906_fa \
+  --kv-cache-dtype gfx906_q8_0 \
   --cuda-graph-backend-decode=full \
+  --cuda-graph-bs-decode 1 \
   --cuda-graph-backend-prefill=disabled \
   --context-length 4096 --mem-fraction-static 0.9 \
   --max-running-requests 16 \
@@ -52,9 +56,11 @@ python -m sglang.launch_server \
 - 必须 `--tp 2`：文本权重约 19 GB，单卡 16 GB 放不下。
 - 必须 `--dtype float16`：gfx906 没有 bf16 硬件，checkpoint 是 bf16 原生。
 - 必须 `--language-model-only`：跳过视觉塔（vision 路径需要 bf16）。
-- 权重加载后每卡约 `9.3 GB`；开启 graph 后运行中每卡约 `15.3 / 16 GiB`。
+- 必须 `SGLANG_MAMBA_CONV_DTYPE=float16`：默认 conv state 是 bf16，长 prefill 会崩。
+- 权重加载后每卡约 `9.3 GB`；Q8 KV 运行中约 `14.0 / 16 GiB`。
 - 健康检查：`curl http://127.0.0.1:30000/health` → `200`。
-- `--cuda-graph-backend-decode=full` 已由用户验证可 capture（bs 1/2/4/5，约 4.3 s）。
+- 备选：`--attention-backend triton`（不带 `--kv-cache-dtype`）为 fp16 KV，decode
+  约 22.8 tok/s，但 KV 容量只有 81,664 tokens。
 
 请求时如果要关闭 thinking（模板默认开启）：
 
@@ -80,10 +86,12 @@ python -m sglang.launch_server \
 
 | 场景 | 结果 |
 |---|---|
-| 服务日志 decode（graph + exllama，steady） | **22.8 token/s** |
-| 223 output tokens（含 prefill/HTTP） | 11.0 s，约 20 token/s 墙钟 |
-| 启动时间（磁盘热） | ~42 s（含 graph capture 约 4.3 s） |
-| 每卡显存 | 权重 9.3 GB，运行时 15.3 / 16 GiB |
+| 最终配置：FA + Q8 KV + graph | **22.0 token/s**（222 tokens / 11.3 s） |
+| fp16 FA + graph | 22.4 token/s |
+| Triton + fp16 + graph | 22.8 token/s |
+| KV 容量（Q8 vs fp16） | **106,663 vs 81,664 tokens**（+30.6%） |
+| 启动时间（磁盘热） | ~55 s（含 graph capture） |
+| 每卡显存 | 权重 9.3 GB，Q8 KV 运行时约 14.0 / 16 GiB |
 
 W4A16 单层微基准（M=1，真实 checkpoint shape，exllama vs 原 Triton）：
 
@@ -98,7 +106,7 @@ W4A16 单层微基准（M=1，真实 checkpoint shape，exllama vs 原 Triton）
 
 ---
 
-## 3. 本仓库的改动（未提交）
+## 3. 本仓库的改动
 
 | 文件 | 改动 |
 |---|---|
@@ -107,6 +115,11 @@ W4A16 单层微基准（M=1，真实 checkpoint shape，exllama vs 原 Triton）
 | `.../compressed_tensors/schemes/__init__.py` | 导出两个新 scheme 和 `gfx906_gptq_available` |
 | `.../compressed_tensors/schemes/compressed_tensors_wna16_triton.py` | **新增文件**：从 `sglang-mi50` 搬来的纯 Triton dequant+GEMM W4A16 kernel；基类改为 `CompressedTensorsLinearScheme`；**修复 zero-point `+1` bug** |
 | `.../compressed_tensors/schemes/compressed_tensors_wna16_exllama.py` | **新增文件**：vllm-gfx906 的 exllama GPTQ W4A16 kernel 接入；权重/scale/zero-point 布局转换 + `gptq_gemm` |
+| `.../attention/gfx906_fa/` | **新增目录**：vendored FA wrapper + tuning + `ext.py` 扩展加载器 |
+| `.../attention/gfx906_fa_backend.py` | **新增文件**：gfx906 FA SGLang backend；静态 graph buffer（block_table/seq_lens/slot/cu_q） |
+| `.../attention/attention_registry.py`、`arg_groups/choices.py` | 注册 `gfx906_fa` backend |
+| `.../quantization/gfx906_q8_kv_cache.py` | **新增文件**：`gfx906_q8_0` KV recipe（K q8_0 + V fp16，planar） |
+| `mem_cache/kv_cache_dtype.py`、`kv_cache_configurator.py`、`pool_configurator.py`、`arg_groups/fields/model.py` | `--kv-cache-dtype gfx906_q8_0` 解析、quant method、容量计算、CLI choice |
 
 ### 关键修复：W4A16 zero-point
 
@@ -213,7 +226,7 @@ torch-memory-saver build ninja numba uvloop watchfiles xgrammar llguidance`
 - W4A16 从 Triton 换成 exllama GPTQ kernel。
 - decode：4.5 → **22.8 tok/s**。
 
-### P1 — 把 vllm-gfx906 的 Q8 FA backend 搬进 SGLang
+### P1 — ✅ 把 vllm-gfx906 的 Q8 FA backend 搬进 SGLang（已完成，见第 6 节）
 
 参考仓库：`/home/neko/Projects/vllm-gfx906-performance`
 
@@ -250,7 +263,7 @@ SGLang 接入点：
 -D__HIP_PLATFORM_AMD__ -U__HIP_NO_HALF_OPERATORS__ -U__HIP_NO_HALF_CONVERSIONS__
 ```
 
-### P2 — fp16 GEMV / down_proj / elementwise
+### P2 — fp16 GEMV / down_proj / elementwise（剩余优化）
 
 W4A16 已经是 exllama，剩余可优化项（参考 vLLM 的 34 ms/step 预算）：
 
@@ -274,7 +287,70 @@ W4A16 已经是 exllama，剩余可优化项（参考 vLLM 的 34 ms/step 预算
 
 ---
 
-## 6. 参考
+## 6. gfx906 FA + Q8 KV（vLLM 方案，已跑通）
+
+### 新增文件
+
+| 文件 | 作用 |
+|---|---|
+| `python/sglang/srt/layers/attention/gfx906_fa/` | vendored FA wrapper：`gfx906_fa_paged.py`、`tuning.py`、`ext.py`（按路径加载 `_gfx906_fa_C*.so`） |
+| `.../attention/gfx906_fa_backend.py` | SGLang `AttentionBackend`：decode/extend、静态 graph buffer、KV 写入 |
+| `.../quantization/gfx906_q8_kv_cache.py` | `gfx906_q8_0` KV recipe：K q8_0 + V fp16 |
+| `attention_registry.py` / `arg_groups/choices.py` | 注册 `gfx906_fa` backend |
+| `mem_cache/kv_cache_dtype.py` / `kv_cache_configurator.py` / `pool_configurator.py` | `--kv-cache-dtype gfx906_q8_0` 的解析、量化方法、容量计算 |
+
+### Q8 KV 布局
+
+- K：`(head_dim/32)*34` 字节/head，**planar** 布局
+  `[quants plane: D bytes | scales plane: (D/32)*2 bytes]`
+- V：fp16，`head_dim * 2` 字节/head
+- 写入：`reshape_and_cache_q8`（K）+ `index_copy_`（V）
+- 容量：`compute_cell_size` 按字节计算；cell 里 `kv_size` 是 dtype element size（2），**不要**再乘一次 token 数
+
+### CUDA graph 的关键 bug 与修复
+
+现象：Q8 KV + graph 前几个 token 正常，随后重复/`!`；eager 正常。
+
+排查结论：
+
+- q8 写入 kernel 确实执行，K/V 落在正确 slot（`k_nonzero≈1.0`）
+- `block_table` / `seq_lens` / `out_cache_loc` 在 graph 外都是对的
+- 根因：**capture 期间 `self.forward_metadata` 被 eager 的 `init_forward_metadata` 覆盖**，
+  graph 里烘焙的是 capture 时的 eager tensor（不是持久 buffer），replay 时这些
+  tensor 没有更新
+- 修复：
+  - `init_cuda_graph_state` 预分配持久 `_graph_block_table`、`_graph_seq_lens`、
+    `_graph_slot`、`_graph_cu_q`
+  - `init_forward_metadata_out_graph` 在 **replay 之前**用当前 `req_to_token` /
+    `seq_lens` / `out_cache_loc` 原地刷新这些 buffer
+  - `_forward` 在 decode + graph 模式下**强制使用这些静态 buffer**，不再读
+    `self.forward_metadata`
+- 这同时修掉了 fp16 FA graph 的 `7 7 / 11 11` 重复问题
+
+vLLM 的对应做法：metadata 全部是持久 buffer（`seq_lens`/`block_table`/`slot_mapping`），
+KV 更新是独立 op，graph 只读 live buffer；SGLang 这边用上面的静态 buffer 达到同样效果。
+
+### 实测
+
+| 配置 | decode | KV tokens | 输出 |
+|---|---:|---:|---|
+| FA + Q8 KV + graph | **22.0 tok/s** | **106,663** | 正确（1..20、诗、250 字短文） |
+| FA + fp16 KV + graph | 22.4 tok/s | 81,664 | 正确 |
+| Triton + fp16 KV + graph | 22.8 tok/s | 81,664 | 正确 |
+
+Q8 KV 的容量收益是 **+30.6%**，速度只损失约 2%。
+
+### 限制
+
+- Q8 KV 目前只验证了 `--cuda-graph-bs-decode 1`；多 batch/spec decode 未测
+- Q8 KV 的 `store_dtype`/descriptor 对 `row_bytes` 仍假设统一 dtype（K 是 uint8），
+  不影响当前 NHD/token-major 路径，但 PD transfer / post-capture VMM 未验证
+- FA backend 依赖 vLLM 仓库的 `_gfx906_fa_C*.so`；Q8 KV 写入依赖同一扩展
+- FA/GPTQ 扩展的源码仍未 vendored/rebuilt（见 P4）
+
+---
+
+## 7. 参考
 
 - 上游 SGLang：`/home/neko/Projects/sglang-gfx906`（本仓库）
 - mi50 补丁 / shim / 旧方案：`/home/neko/Projects/sglang-mi50`

@@ -73,6 +73,13 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "gfx906_q8_0":
+        if not _is_hip:
+            raise ValueError("--kv-cache-dtype gfx906_q8_0 is ROCm/gfx906 only.")
+        # K is stored as packed uint8 by the quant method; the pool's element
+        # dtype stays the model dtype so V/scales keep fp16 semantics.
+        kv_cache_dtype = model_dtype
+        resolved_kv_cache_dtype = "gfx906_q8_0"
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2

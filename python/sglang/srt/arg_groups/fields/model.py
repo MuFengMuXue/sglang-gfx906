@@ -213,6 +213,7 @@ class Model(msgspec.Struct):
                 "mxfp8",
                 "bf16",
                 "bfloat16",
+                "gfx906_q8_0",
                 "nvfp4",
                 "fp4_mx_block16",
             ],
