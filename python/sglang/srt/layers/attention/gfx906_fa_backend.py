@@ -160,16 +160,19 @@ class Gfx906FAttnBackend(AttentionBackend):
                 layer, KVWriteLoc.for_batch(forward_batch), k, v
             )
 
+        b = forward_batch.seq_lens.shape[0]
         if (
             self._graph_block_table is not None
             and self._graph_seq_lens is not None
             and forward_batch.forward_mode.is_decode()
+            and b == self._graph_max_bs
         ):
             # Decode graph: always read the persistent graph buffers. They are
             # refreshed outside the graph before replay; self.forward_metadata
             # may have been overwritten by an eager init_forward_metadata pass
             # during capture, which would bake an eager tensor into the graph.
-            b = forward_batch.seq_lens.shape[0]
+            # Eager bs>captured (e.g. two concurrent requests with a bs=1
+            # graph) must use the live metadata instead.
             block_table = self._graph_block_table[:b]
             seq_lens = self._graph_seq_lens[:b]
             cu_q = self._graph_cu_q[: b + 1]

@@ -2,9 +2,10 @@
 
 最后更新：2026-10-24
 状态：**已跑通 vLLM 的 gfx906 FA + Q8 KV 方案，并接入 fused norm/silu + LLMM1**。
-Qwen3.8-27B-AWQ-INT4 在 2× MI50 上 TP=2，短上下文 CUDA graph decode 约
+Qwen3.8-27B-AWQ-INT4 在 2× MI50 上 TP=2，CUDA graph decode 约
 **33.7 tok/s**，KV 容量 **106,663 tokens**（fp16 为 81,664，+30.6%）。
-长上下文（约 2.4k tokens 以上）目前仍有 NaN/GPU Hang 问题，见第 8 节。
+长上下文（2.4k / 3.4k / 3.8k tokens）和两路并发均已验证正确；长上下文 NaN
+的根因与修复见第 8 节。
 
 ---
 
@@ -364,35 +365,57 @@ Q8 KV 的容量收益是 **+30.6%**，速度只损失约 2%。
 
 ---
 
-## 8. 当前问题：长上下文 NaN / GPU Hang（2026-10-24）
+## 8. 长上下文 NaN：根因与修复（2026-10-24）
 
-短上下文（<2k tokens）已到 **33.7 tok/s**，但约 **2.4k tokens** 的 prompt 会输出
-连续的 `!`。logprobs 显示 top-3 token 是 id 0/1/2（`!`、`"`、`#`），说明最终
-logits 已经变成 NaN/常数，不是普通的量化误差。
+### 现象
 
-已排除/确认：
+约 2.4k tokens 的 prompt 会输出连续的 `!`；logprobs 的 top-3 token 是 id 0/1/2，
+说明最终 logits 是 NaN/常数。短上下文正常；`--attention-backend triton` + fp16 KV
+也复现；关闭 radix cache / chunked prefill 也复现。
 
-- `--attention-backend triton` + fp16 KV 同样复现，所以不是 Q8 KV 或 FA 单独导致
-- 关闭 radix cache、关闭 chunked prefill（单 chunk 2431）仍然复现
-- 2076 tokens 正常，2416+ 失败；阈值大约在 2.2k–2.4k
-- 反复发长 prompt 会触发 `GPU Hang`；GPU0 VRAM 残留约 17GB，`KFD Processes`
-  为空，需要 **重启机器** 才能清掉
+### 定位过程
 
-新增的隔离开关：
+- 用逐层 forward hook 记录 `finite/absmax`，第一层 NaN 出现在 **layer 44**
+  （一个 GDN 层，紧跟 layer 43 的 full attention）
+- 纯 `torch.cuda.synchronize()` 不能稳定修复；异步 hook 的额外 D2H 有时能改变结果
+- **`PYTORCH_NO_CUDA_MEMORY_CACHING=1` 后连续 2/2 正确** → 说明读到了缓存分配器
+  回收页里的旧 NaN，而不是确定性数值问题
+- 根因：**fresh request 的 GDN conv/SSM state 槽位没有真正清零**；层 44 的
+  `chunk_gated_delta_rule` 在 `initial_state` 中读到了上一个请求/分配器留下的 NaN
 
-```bash
-SGLANG_GFX906_FUSED_OPS=0   # 关闭 fused rms_norm / silu_and_mul
-SGLANG_GFX906_LLMM1=0       # 关闭 LLMM1，回退 F.linear
-SGLANG_MAMBA_CONV_DTYPE=float32  # conv state 用 fp32（默认当前是 float16）
+### 修复
+
+`gdn_backend.py` 的 prefill/extend 路径：当 `extend_prefix_lens == 0`（真正的
+fresh request，不是 chunked prefill 的后续 chunk）时，在调用 GDN kernel 前显式：
+
+```python
+conv_states_contig[state_cache_indices] = 0
+ssm_states_contig[state_cache_indices] = 0
 ```
 
-重启后的排查顺序：
+只清零本请求的 slot；prefix cache / 后续 chunk 不受影响。
 
-1. 两个优化都关 + `SGLANG_MAMBA_CONV_DTYPE=float16`，跑 2431 prompt：确认是否是
-   改动前就存在的 GDN/fp16 长序列问题
-2. 改 `SGLANG_MAMBA_CONV_DTYPE=float32` 再跑
-3. 只开 fused / 只开 LLMM1，二选一定位
-4. 如果确认是 LLMM1：先只对 qkv / in_proj 用 LLMM1，`lm_head` 保持 `F.linear`
-   （lm_head 的 hidden 值幅度最大，最可能是 fp16 half2 累加溢出）
-5. 如果确认是 GDN 长序列：评估移植 vLLM 的
-   `csrc/gdn/fused_gdn_decode_kernel.cu`，或改 SGLang FLA chunk 路径
+同时修了并发路径：decode graph 只在 `batch_size == graph_max_bs` 时使用静态
+graph buffer；两路并发（bs=2）会走 eager metadata，不再错用只为 bs=1 捕获的
+buffer。
+
+### 验证
+
+| 场景 | 结果 |
+|---|---|
+| 2431 tokens，连续 3 次 | 正确 |
+| 3451 tokens | 正确 |
+| 3791 tokens | 正确 |
+| 两路并发（2402 + 2062 tokens） | 两路都正确 |
+| 短上下文 decode | **33.6–33.7 tok/s**（未回退） |
+| 1..20 / 中文诗 | 正确 |
+
+长上下文 2431 + 32 输出墙钟约 6.3 s（主要是 prefill）；短 prompt 256 输出约
+8 s。
+
+### 备注
+
+- 长上下文修复只在 `extend_prefix_lens == 0` 时清零；如果后续发现 prefix-cache
+  恢复状态也有旧值，需要在 restore 路径同样校验。
+- 两路并发目前走 eager decode（graph 只捕获 bs=1），正确但吞吐低于单路 graph；
+  多 bs graph 仍是下一步。

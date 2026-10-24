@@ -1038,6 +1038,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
+        # A fresh request has no prefix state; make sure the slot is really
+        # zero even if the allocator handed back a recycled page with NaN/stale
+        # contents.  (Observed on gfx906: the first GDN layer after a full
+        # attention layer could read a non-zeroed slot and produce NaN logits.)
+        if (
+            not is_target_verify
+            and forward_batch.extend_prefix_lens is not None
+            and bool((forward_batch.extend_prefix_lens == 0).all())
+        ):
+            valid = state_cache_indices >= 0
+            idx = state_cache_indices[valid]
+            if idx.numel() > 0:
+                conv_states_contig[idx] = 0
+                ssm_states_contig[idx] = 0
+
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
