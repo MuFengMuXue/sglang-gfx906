@@ -52,9 +52,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16Exllama,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     CompressedTensorsWNA16Triton,
+    gfx906_gptq_available,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A8mxfp4MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
@@ -749,13 +751,16 @@ class CompressedTensorsConfig(QuantizationConfig):
                 quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
-                scheme_cls = (
-                    CompressedTensorsWNA16Triton
-                    if _on_gfx906()
-                    else XPUCompressedTensorsWNA16
-                    if _is_xpu
-                    else CompressedTensorsWNA16
-                )
+                if _on_gfx906():
+                    scheme_cls = (
+                        CompressedTensorsWNA16Exllama
+                        if gfx906_gptq_available()
+                        else CompressedTensorsWNA16Triton
+                    )
+                elif _is_xpu:
+                    scheme_cls = XPUCompressedTensorsWNA16
+                else:
+                    scheme_cls = CompressedTensorsWNA16
                 return scheme_cls(
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,

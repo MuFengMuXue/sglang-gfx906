@@ -30,6 +30,10 @@ from .compressed_tensors_wNa16_moe import (
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
+from .compressed_tensors_wna16_exllama import (
+    CompressedTensorsWNA16Exllama,
+    gfx906_gptq_available,
+)
 from .compressed_tensors_wna16_triton import CompressedTensorsWNA16Triton
 
 __all__ = [
@@ -46,6 +50,7 @@ __all__ = [
     "CompressedTensorsWNA16MoE",
     "CompressedTensorsWNA16TritonMoE",
     "CompressedTensorsWNA16Triton",
+    "CompressedTensorsWNA16Exllama",
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
     "WNA16_SUPPORTED_BITS",
     "CompressedTensorsW4A16Fp4",
