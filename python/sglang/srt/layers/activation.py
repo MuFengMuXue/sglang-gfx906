@@ -108,6 +108,16 @@ elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+
+    # The vLLM stable-ABI extension ships the fused silu_and_mul kernel.
+    # Prefer it over the multi-kernel torch shim (sgl_kernel on gfx906).
+    try:
+        from sglang.srt.layers import gfx906_ops as _gfx906_ops
+
+        if _gfx906_ops.available():
+            silu_and_mul = _gfx906_ops.silu_and_mul
+    except Exception:
+        pass
 elif _is_musa:
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 

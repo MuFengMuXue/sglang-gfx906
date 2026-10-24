@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -69,6 +70,65 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
+
+_gfx906_llmm1 = None
+_gfx906_llmm1_checked = False
+
+
+def _try_gfx906_llmm1(
+    layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """M=1 fp16 GEMV through the gfx906 LLMM1 kernel.
+
+    hipBLAS is ~6-10x off the HBM floor for these shapes on gfx906 (a 7168x5120
+    decode projection takes ~870 us instead of ~90 us), while LLMM1 is at the
+    read-bandwidth limit.  Only the single-token decode path is eligible; M>1
+    (prefill / spec verify) stays on the existing GEMM path.
+    """
+    global _gfx906_llmm1, _gfx906_llmm1_checked
+
+    if (
+        not _is_hip
+        or torch.compiler.is_compiling()
+        or os.environ.get("SGLANG_GFX906_LLMM1", "1") == "0"
+    ):
+        return None
+    if (
+        bias is not None
+        or x.dtype != torch.float16
+        or not x.is_cuda
+        or layer.weight.dtype != torch.float16
+    ):
+        return None
+    weight = layer.weight
+    if not weight.is_contiguous() or weight.dim() != 2:
+        return None
+    if weight.shape[0] % 4 != 0:
+        return None
+
+    x2 = x.reshape(-1, x.shape[-1])
+    if x2.shape[0] != 1 or x2.shape[1] != weight.shape[1]:
+        return None
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+
+    if not _gfx906_llmm1_checked:
+        _gfx906_llmm1_checked = True
+        try:
+            from sglang.srt.layers.quantization import gfx906_llmm1 as _mod
+
+            if _mod.available():
+                _gfx906_llmm1 = _mod
+        except Exception:
+            _gfx906_llmm1 = None
+    if _gfx906_llmm1 is None:
+        return None
+
+    out = _gfx906_llmm1.llmm1(weight, x2, 4)
+    if x.dim() != 2:
+        out = out.reshape(*x.shape[:-1], out.shape[-1])
+    return out
+
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -610,6 +670,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
+
+        out = _try_gfx906_llmm1(layer, x, bias)
+        if out is not None:
+            return out
 
         return F.linear(x, layer.weight, bias)
 

@@ -14,6 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Optional, Tuple, Union
 
@@ -133,6 +134,19 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
+
+    if not _has_vllm_rms_norm:
+        # The vLLM stable-ABI extension already exports the same fused
+        # kernels; use it directly instead of importing the vllm package.
+        try:
+            from sglang.srt.layers import gfx906_ops as _gfx906_ops
+
+            if _gfx906_ops.available():
+                rms_norm = _gfx906_ops.rms_norm
+                fused_add_rms_norm = _gfx906_ops.fused_add_rms_norm
+                _has_vllm_rms_norm = True
+        except Exception:
+            pass
 
 if _is_hip:
     try:
@@ -768,7 +782,17 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Fallback to native implementation if vllm is not available
+        # Variants the fused kernel does not model keep the native reference.
+        if (
+            os.environ.get("SGLANG_GFX906_FUSED_OPS", "1") == "0"
+            or self.cast_x_before_out_mul
+            or self.fp32_residual
+            or self.variance_size_override is not None
+            or getattr(self, "x_pad_to_multiple", 0)
+        ):
+            return self.forward_native(x, residual, post_residual_addition)
+
+        # Fallback to native implementation if the fused ops are unavailable.
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
@@ -779,27 +803,31 @@ class RMSNorm(BaseFusedOp):
                 or get_exec().deterministic.rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
+            weight = self.weight.data if self.has_weight else None
+            if weight is not None and weight.dtype != x.dtype:
+                weight = weight.to(x.dtype)
             return rms_norm_batch_invariant(
                 x,
-                self.weight.data,
+                weight,
                 self.variance_epsilon,
             )
 
         if not x.is_contiguous():
-            # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
+        weight = self.weight.data if self.has_weight else None
+        if weight is not None and weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
+            if not residual.is_contiguous():
+                residual = residual.contiguous()
+            # The vLLM fused op is in-place: x += residual, then RMSNorm(x).
+            return fused_add_rms_norm(
+                x, residual, weight, self.variance_epsilon
             )
-            return out, residual_out
-        out = torch.empty_like(x)
-        rms_norm(out, x, self.weight.data, self.variance_epsilon)
-        return out
+        return rms_norm(x, weight, self.variance_epsilon)
 
     def forward_musa(
         self,
@@ -1112,6 +1140,8 @@ class GemmaRMSNorm(BaseFusedOp):
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
+        # Cached (1 + weight) in the activation dtype for the fused kernel.
+        self._gemma_weight_cast = None
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
@@ -1126,6 +1156,24 @@ class GemmaRMSNorm(BaseFusedOp):
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         # CPU offload may move the parameter to host while the buffer stays on device.
         self.gemma_weight.copy_(self.weight.data).add_(1.0)
+        self._gemma_weight_cast = None
+
+    def _gemma_weight_for(self, dtype: torch.dtype) -> torch.Tensor:
+        """(1 + weight) in ``dtype`` for the fused RMSNorm kernel.
+
+        The fused kernel requires weight.dtype == x.dtype (vLLM's
+        GemmaRMSNorm.forward_cuda does the same).  Cache the cast so the
+        decode fast path does not launch a cast kernel per layer per step.
+        """
+        cached = self._gemma_weight_cast
+        if (
+            cached is None
+            or cached.dtype != dtype
+            or cached.device != self.gemma_weight.device
+        ):
+            cached = self.gemma_weight.to(dtype)
+            self._gemma_weight_cast = cached
+        return cached
 
     def _forward_impl(
         self,
@@ -1183,6 +1231,9 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if os.environ.get("SGLANG_GFX906_FUSED_OPS", "1") == "0":
+            return self.forward_native(x, residual, post_residual_addition)
+
         if _use_aiter and _has_rocm_triton_gemma_rms_norm:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -1199,24 +1250,20 @@ class GemmaRMSNorm(BaseFusedOp):
             # AITER's ROCm rmsnorm2d_fwd has the same dtype requirement here;
             # keep Gemma RMSNorm on native torch math for correctness.
             return self.forward_native(x, residual, post_residual_addition)
-        else:
-            w = self.gemma_weight
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
-            if not x.is_contiguous():
-                x = x.contiguous()
-            if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
-                return out, residual_out
-            out = torch.empty_like(x)
-            rms_norm(out, x, w, self.variance_epsilon)
-            return out
+
+        # The fused kernel requires weight.dtype == x.dtype; pass (1 + w)
+        # in the activation dtype instead of the fp32 gemma_weight buffer.
+        w = self._gemma_weight_for(x.dtype)
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            if not residual.is_contiguous():
+                residual = residual.contiguous()
+            # In-place: x += residual, then Gemma RMSNorm(x).
+            return fused_add_rms_norm(x, residual, w, self.variance_epsilon)
+        return rms_norm(x, w, self.variance_epsilon)
 
     def forward_cpu(
         self,
